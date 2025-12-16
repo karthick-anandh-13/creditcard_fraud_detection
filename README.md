@@ -200,21 +200,8 @@ Designed scalable API endpoints
 
 Gained experience in real-world ML system design
 
-🔮 Future Enhancements (Optional)
-
-Authentication & API keys
-
-Model monitoring and drift detection
-
-Risk scoring levels (LOW / MEDIUM / HIGH)
-
-Frontend dashboard
-
-Cloud deployment
 
 ✅ Conclusion
 
 This project demonstrates a complete, end-to-end machine learning backend for fraud detection.
 It combines accuracy, interpretability, and engineering best practices while remaining fully accessible and cost-free.
-
-The system is suitable for academic evaluation, portfolio presentation, and technical interviews
