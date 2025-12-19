@@ -9,6 +9,7 @@ import logging
 import shap
 
 from data.schema import FEATURE_COLUMNS
+from data.upi_schema import UPI_FEATURE_COLUMNS
 
 # =====================================================
 # ENV + LOGGING
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 # FASTAPI APP
 # =====================================================
 app = FastAPI(
-    title="Credit Card Fraud Detection API",
+    title="Transaction Fraud Detection API",
     version="1.0.0"
 )
 
@@ -36,7 +37,20 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 MODEL_DIR = BASE_DIR / "models"
 
 # =====================================================
-# LOAD SUPERVISED MODELS
+# RISK SCORING FUNCTION (FIXED: WAS MISSING)
+# =====================================================
+def risk_score(prob: float):
+    if prob >= 0.85:
+        return 90, "CRITICAL"
+    elif prob >= 0.65:
+        return 75, "HIGH"
+    elif prob >= 0.35:
+        return 50, "MEDIUM"
+    else:
+        return 20, "LOW"
+
+# =====================================================
+# LOAD CREDIT CARD MODELS
 # =====================================================
 MODELS = {}
 
@@ -48,7 +62,6 @@ except Exception as e:
     logger.exception("Failed to load main models")
     raise RuntimeError(str(e))
 
-# Decision Tree
 try:
     MODELS["decision_tree"] = joblib.load(MODEL_DIR / "fraud_decision_tree.pkl")
     logger.info("Decision Tree loaded")
@@ -56,20 +69,17 @@ except Exception:
     logger.warning("Decision Tree not available")
 
 # =====================================================
-# LOAD ISOLATION FOREST
+# LOAD ANOMALY MODELS
 # =====================================================
 ISO_MODEL = None
+KNN_MODEL = None
+KNN_SCALER = None
+
 try:
     ISO_MODEL = joblib.load(MODEL_DIR / "fraud_isolation_forest.pkl")
     logger.info("Isolation Forest loaded")
 except Exception:
     logger.warning("Isolation Forest not available")
-
-# =====================================================
-# LOAD KNN ANOMALY MODEL
-# =====================================================
-KNN_MODEL = None
-KNN_SCALER = None
 
 try:
     knn_bundle = joblib.load(MODEL_DIR / "fraud_knn.pkl")
@@ -80,19 +90,49 @@ except Exception:
     logger.warning("KNN model not available")
 
 # =====================================================
-# SHAP (LIGHTGBM ONLY)
+# SHAP (CREDIT CARD – LIGHTGBM)
 # =====================================================
 SHAP_EXPLAINER = None
 try:
     lgbm_pipeline = MODELS["lightgbm"]
     lgbm_model = lgbm_pipeline.steps[-1][1]
     SHAP_EXPLAINER = shap.TreeExplainer(lgbm_model)
-    logger.info("SHAP explainer initialized")
+    logger.info("SHAP explainer initialized (credit card)")
 except Exception:
     logger.warning("SHAP explainer not available")
 
 # =====================================================
-# REQUEST SCHEMA
+# LOAD UPI MODELS
+# =====================================================
+UPI_MODELS = {}
+
+try:
+    UPI_MODELS["lightgbm"] = joblib.load(MODEL_DIR / "upi_fraud_lgbm.pkl")
+    logger.info("UPI LightGBM model loaded")
+except Exception:
+    logger.warning("UPI LightGBM model not available")
+
+try:
+    UPI_MODELS["lightgbm_calibrated"] = joblib.load(
+        MODEL_DIR / "upi_fraud_lgbm_calibrated.pkl"
+    )
+    logger.info("UPI calibrated model loaded")
+except Exception:
+    logger.warning("UPI calibrated model not available")
+
+# =====================================================
+# SHAP (UPI – LIGHTGBM)
+# =====================================================
+UPI_SHAP_EXPLAINER = None
+try:
+    if "lightgbm" in UPI_MODELS:
+        UPI_SHAP_EXPLAINER = shap.TreeExplainer(UPI_MODELS["lightgbm"])
+        logger.info("UPI SHAP explainer initialized")
+except Exception:
+    logger.warning("UPI SHAP explainer not available")
+
+# =====================================================
+# REQUEST SCHEMAS
 # =====================================================
 class Transaction(BaseModel):
     Time: float
@@ -126,23 +166,29 @@ class Transaction(BaseModel):
     V28: float
     Amount: float
 
+
+class UPITransaction(BaseModel):
+    transaction_amount: float
+    hour_of_day: int
+    day_of_week: int
+    transactions_last_1hr: int
+    transactions_last_24hr: int
+    avg_amount_last_7_days: float
+    device_change_flag: int
+    location_change_flag: int
+    failed_attempts_last_1hr: int
+    receiver_new_flag: int
+
 # =====================================================
-# SINGLE PREDICTION
+# CREDIT CARD PREDICTION
 # =====================================================
 @app.post("/predict")
-def predict(
-    transaction: Transaction,
-    model_name: str = Query(
-        "lightgbm",
-        enum=["lightgbm", "xgboost", "decision_tree"]
-    )
-):
-    pipeline = MODELS[model_name]
+def predict(transaction: Transaction,
+            model_name: str = Query("lightgbm", enum=["lightgbm", "xgboost", "decision_tree"])):
 
-    X = pd.DataFrame(
-        [[getattr(transaction, c) for c in FEATURE_COLUMNS]],
-        columns=FEATURE_COLUMNS
-    )
+    pipeline = MODELS[model_name]
+    X = pd.DataFrame([[getattr(transaction, c) for c in FEATURE_COLUMNS]],
+                     columns=FEATURE_COLUMNS)
 
     prob = pipeline.predict_proba(X)[0][1]
     threshold = float(os.getenv("FRAUD_THRESHOLD", 0.5))
@@ -154,127 +200,67 @@ def predict(
     }
 
 # =====================================================
-# BATCH PREDICTION
-# =====================================================
-@app.post("/predict/batch")
-def predict_batch(
-    file: UploadFile = File(...),
-    model_name: str = Query(
-        "lightgbm",
-        enum=["lightgbm", "xgboost", "decision_tree"]
-    )
-):
-    pipeline = MODELS[model_name]
-    df = pd.read_csv(file.file)
-
-    missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
-    if missing:
-        raise HTTPException(400, f"Missing columns: {missing}")
-
-    X = df[FEATURE_COLUMNS]
-    probs = pipeline.predict_proba(X)[:, 1]
-    threshold = float(os.getenv("FRAUD_THRESHOLD", 0.5))
-
-    return {
-        "model": model_name,
-        "total_rows": len(df),
-        "fraud_predictions": [
-            {
-                "row_id": i,
-                "fraud_probability": float(p),
-                "is_fraud": bool(p >= threshold)
-            }
-            for i, p in enumerate(probs)
-        ]
-    }
-
-# =====================================================
-# EXPLAINABILITY (LIGHTGBM)
-# =====================================================
-@app.post("/predict/explain")
-def explain(transaction: Transaction, top_k: int = 5):
-    if SHAP_EXPLAINER is None:
-        raise HTTPException(500, "SHAP not available")
-
-    pipeline = MODELS["lightgbm"]
-
-    X = pd.DataFrame(
-        [[getattr(transaction, c) for c in FEATURE_COLUMNS]],
-        columns=FEATURE_COLUMNS
-    )
-
-    prob = pipeline.predict_proba(X)[0][1]
-
-    shap_values = SHAP_EXPLAINER.shap_values(X)
-    if isinstance(shap_values, list):
-        shap_values = shap_values[1]
-
-    shap_row = shap_values[0]
-    shap_dict = dict(zip(FEATURE_COLUMNS, shap_row))
-
-    top_features = dict(
-        sorted(shap_dict.items(), key=lambda x: abs(x[1]), reverse=True)[:top_k]
-    )
-
-    return {
-        "model": "lightgbm",
-        "fraud_probability": float(prob),
-        "top_contributing_features": {
-            k: float(v) for k, v in top_features.items()
-        }
-    }
-
-# =====================================================
-# HYBRID PREDICTION (ML + ISO + KNN)
+# HYBRID CREDIT CARD PREDICTION
 # =====================================================
 @app.post("/predict/hybrid")
-def predict_hybrid(
-    transaction: Transaction,
-    model_name: str = Query(
-        "lightgbm",
-        enum=["lightgbm", "xgboost", "decision_tree"]
-    )
-):
-    pipeline = MODELS[model_name]
+def predict_hybrid(transaction: Transaction,
+                   model_name: str = Query("lightgbm", enum=["lightgbm", "xgboost", "decision_tree"])):
 
-    X = pd.DataFrame(
-        [[getattr(transaction, c) for c in FEATURE_COLUMNS]],
-        columns=FEATURE_COLUMNS
-    )
+    pipeline = MODELS[model_name]
+    X = pd.DataFrame([[getattr(transaction, c) for c in FEATURE_COLUMNS]],
+                     columns=FEATURE_COLUMNS)
 
     prob = pipeline.predict_proba(X)[0][1]
 
-    iso_anomaly = False
-    if ISO_MODEL is not None:
-        iso_anomaly = ISO_MODEL.predict(X)[0] == -1
+    iso_anomaly = ISO_MODEL is not None and ISO_MODEL.predict(X)[0] == -1
 
     knn_anomaly = False
-    knn_distance = None
     if KNN_MODEL is not None:
         X_scaled = KNN_SCALER.transform(X)
-        distances, _ = KNN_MODEL.kneighbors(X_scaled)
-        knn_distance = float(distances.mean())
-        knn_anomaly = knn_distance > 3.0
+        knn_anomaly = X_scaled.mean() > 3.0
 
     threshold = float(os.getenv("FRAUD_THRESHOLD", 0.5))
 
     return {
-        "model": model_name,
         "fraud_probability": float(prob),
         "isolation_forest_anomaly": iso_anomaly,
         "knn_anomaly": knn_anomaly,
-        "knn_distance": knn_distance,
         "final_decision": bool(prob >= threshold or iso_anomaly or knn_anomaly)
     }
 
 # =====================================================
-# HEALTH CHECK
+# UPI RISK PREDICTION (CALIBRATED)
+# =====================================================
+@app.post("/upi/predict/risk")
+def predict_upi_risk(transaction: UPITransaction):
+    if "lightgbm_calibrated" not in UPI_MODELS:
+        raise HTTPException(500, "Calibrated model not available")
+
+    model = UPI_MODELS["lightgbm_calibrated"]
+    X = pd.DataFrame([transaction.dict()])
+
+    prob = model.predict_proba(X)[0][1]
+    score, level = risk_score(prob)
+
+    return {
+        "domain": "upi",
+        "calibrated_probability": float(prob),
+        "risk_score": score,
+        "risk_level": level,
+        "recommended_action": (
+            "BLOCK" if level == "CRITICAL"
+            else "STEP_UP_AUTH" if level in ["HIGH", "MEDIUM"]
+            else "ALLOW"
+        )
+    }
+
+# =====================================================
+# HEALTH
 # =====================================================
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "models_loaded": list(MODELS.keys()),
-        "iso_loaded": ISO_MODEL is not None,
-        "knn_loaded": KNN_MODEL is not None
+        "credit_models": list(MODELS.keys()),
+        "upi_models": list(UPI_MODELS.keys())
     }

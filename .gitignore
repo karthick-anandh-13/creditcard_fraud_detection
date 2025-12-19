@@ -10,7 +10,8 @@ __pycache__/
 # Virtual Environment
 # =========================
 venv/
-.env/
+.venv/
+.env
 
 # =========================
 # IDE / Editor
@@ -30,12 +31,15 @@ Thumbs.db
 # Logs
 # =========================
 *.log
+audit_logs/
+audit/logs/
 
 # =========================
 # Data (Large / Sensitive)
 # =========================
 data/raw/*.csv
 data/processed/*
+*.csv
 !data/schema.py
 
 # =========================
@@ -66,3 +70,9 @@ dist/
 # FastAPI / Uvicorn
 # =========================
 *.pid
+
+# =========================
+# Archives / binaries
+# =========================
+*.zip
+2.0.0
